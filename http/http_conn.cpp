@@ -225,7 +225,7 @@ http_conn::HTTP_CODE http_conn::process_read() {
 	while (((m_check_state == CHECK_STATE_CONTENT) && (line_status == LINE_OK)) || (line_status = parse_line()) == LINE_OK) {
 		text = get_line();
 		m_start_line = m_check_index;
-		printf("获得一行待解析数据：%s\n",text);
+		//printf("获得一行待解析数据：%s\n",text);
 		switch (m_check_state)
 		{
 		case CHECK_STATE_REQUESTLINE: 
@@ -443,7 +443,7 @@ http_conn::HTTP_CODE http_conn::parse_request_line(char* text) {
 }
 //分析请求首部
 http_conn::HTTP_CODE http_conn::parse_headers(char* text) {
-	printf("待解析的请求头数据是:%s\n",text);
+	//printf("待解析的请求头数据是:%s\n",text);
 	//判断是空行还是请求头
 	if (text[0] == '\0') {
 		//判断是GET请求还是POST请求

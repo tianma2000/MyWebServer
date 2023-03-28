@@ -10,9 +10,16 @@
 #include <exception>
 #include <errno.h>
 #include <sys/epoll.h>
+#include "./timer/lst_timer.h"
+#include <signal.h>
+#include <assert.h>
 
 #define MAX_FD 65535 //最多的文件描述符个数
 #define MAX_EVENT_NUMBER 10000  //最大监听的事件的个数
+#define TIMESLOT 5
+static int pipefd[2];
+static sort_timer_lst timer_lst;
+static int epollfd=0;
 
 //添加epoll监听事件
 extern void addfd(int epollfd, int fd, bool oneshot);
@@ -22,6 +29,44 @@ extern void removefd(int epollfd, int fd);
 
 //修改文件描述符
 extern void modfd(int epollfd,int fd);
+
+//设置文件非阻塞
+extern void setnoblock(int fd);
+
+//信号处理函数
+void sig_handler(int sig){
+	int save_errno = errno;
+	int msg = sig;
+	send(pipefd[1], (char*)&msg, 1, 0);
+	errno = save_errno;
+}
+//添加监听信号,启动信号处理函数
+void addsig(int sig) {
+	struct sigaction sa;
+	memset(&sa, '\0', sizeof(sa));
+	sa.sa_handler = sig_handler;
+	sa.sa_flags |= SA_RESTART;
+	sigfillset(&sa.sa_mask);
+	assert(sigaction(sig, &sa, NULL) != -1);
+}
+
+void timer_handler() {
+	/*定时处理任务，实际上就是调用tick函数*/
+	timer_lst.tick();
+	/*因为一次alarm调用只会引起一次SIGALRM信号，所以我们需要重新定时，以不断触发SIGALRM信号*/
+	alarm(TIMESLOT);
+}
+
+/*定时器回调函数，它删除非活动连接socket上的注册事件，并关闭*/
+void cb_func(client_data* user_data) {
+	epoll_ctl(epollfd, EPOLL_CTL_DEL, user_data->sockfd, 0);
+	assert(user_data);
+	close(user_data->sockfd);
+	//减少链接数
+	http_conn::m_user_count--;
+	printf("close fd%\n", user_data->sockfd);
+}
+
 
 int main(int argc, char* argv[]) {
 	if (argc <= 1) {
@@ -60,6 +105,22 @@ int main(int argc, char* argv[]) {
 	int epollfd = epoll_create(5);
 	epoll_event events[MAX_EVENT_NUMBER];
 
+	ret=socketpair(PF_UNIX,SOCK_STREAM,0,pipefd);
+	assert(ret!=-1);
+	setnoblock(pipefd[1]);
+	addfd(epollfd,pipefd[0],false);
+
+	/*设置信号处理函数*/
+	addsig(SIGALRM);
+	addsig(SIGTERM);
+
+	client_data * users_timer=new client_data[MAX_FD];
+	//超时默认为false
+	bool timeout=false;
+	alarm(TIMESLOT);/*定时*/
+
+
+
 	//将监听文件描述符加入到epoll对象中
 	addfd(epollfd, listenfd, false);
 	http_conn::m_epollfd = epollfd;
@@ -85,26 +146,115 @@ int main(int argc, char* argv[]) {
 				}
 				//将HTTP类中的信息更新。
 				users[connfd].init(connfd,addr);
+
+				//定时器类更新
+				users_timer[connfd].address=addr;
+				users_timer[connfd].sockfd=connfd;
+
+				/*创建定时器，设置回调函数与超时时间，然后绑定定时器与用户数量，最后将定时器添加到链表timer_lst中*/
+				util_timer* timer = new util_timer;
+				//设置定时器对应的连接资源
+				timer->user_data = &users_timer[connfd];
+				//设置回调函数
+				timer->cb_func = cb_func;
+				time_t cur = time(NULL);
+				//设置定时器的绝对超长时间
+				timer->expire = cur + 3 * TIMESLOT;
+				//创建该连接对应的定时器，初始化为前述临时变量
+				users_timer[connfd].timer = timer;
+				//将定时器添加到定时器容器（升序链表中）
+				timer_lst.add_timer(timer);
 			}
 			else if (events[i].events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)) {
 				//对方异常或者错误断开
 				users[sockfd].close_conn();
+				util_timer *timer=users_timer[sockfd].timer;
+				if(timer){
+					timer_lst.del_timer(timer);
+				}
 			}
+			//处理定时器信号
+			else if((sockfd==pipefd[0])&&(events[i].events&EPOLLIN)){
+				//接收到SIGALRM信号，timeout设置为True；
+				int sig;
+				char signals[1024];
+				ret = recv(pipefd[0], signals, sizeof(signals), 0);
+				if (ret == -1) {
+					//handle the error
+					continue;
+				}
+				else if (ret == 0) {
+					continue;
+				}
+				else {
+					for (int i = 0; i < ret; i++) {
+						switch (signals[i]) {
+						case SIGALRM:
+						{
+							/*用timeout变量标记有定时任务需要处理，但不立即处理定时任务。这是因为定时任务的优先级不是很高，我们优先去处理其他更重要的任务*/
+							timeout = true;
+							//printf("改变 timeout的取值为true\n");
+							break;
+						}
+						case SIGTERM:
+						{
+							return -1;
+						}
+						}
+					}
+				}
+			}
+			//处理客户连接上接受到的数据
 			else if (events[i].events & EPOLLIN) {
 				//检测到读事件就绪
 				//主线程去读数据，让子线程去处理逻辑
+
+				//创建定时器临时变量，将该连接对应的定时器取出来
+				util_timer *timer=users_timer[sockfd].timer;
 				if(users[sockfd].read()){
                     pool->append(users+sockfd);
+					//若有数据传输，则将定时器往后延迟3个单位
+					//对其在链表上的位置进行调整
+					if(timer){
+						time_t cur = time(NULL);
+						timer->expire = cur + 3 * TIMESLOT;
+						printf("adjust timer once\n");
+						timer_lst.adjust_timer(timer);
+					}
                 }else{
                     users[sockfd].close_conn();
+					if(timer){
+						timer_lst.del_timer(timer);
+					}
                 }
 			}
 			else if (events[i].events & EPOLLOUT) {
+				util_timer * timer=users_timer[sockfd].timer;
 				//写事件就绪
-				if(!users[sockfd].write()){
+				if(users[sockfd].write()){
+					//若有数据传输，则将定时器往后延迟3个单位
+					//对其在链表上的位置进行调整
+					if(timer){
+						time_t cur = time(NULL);
+						timer->expire = cur + 3 * TIMESLOT;
+						printf("adjust timer once\n");
+						timer_lst.adjust_timer(timer);
+					}
+				}
+				else{
+					//服务器端关闭连接，移除对应的定时器
                    users[sockfd].close_conn(); 
+				   if(timer){
+						timer_lst.del_timer(timer);
+				   }
                 }
 			}
+		}
+		/*最后处理定时事件，因为I/O事件有更高的优先级。当然，我们这样做将导致定时任务不能精确的按照预期的时间执行*/
+		//完成读写事件后，再进行处理
+		if(timeout){
+			timer_handler();
+			timeout=false;
 		}
 	}
 	close(listenfd);
