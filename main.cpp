@@ -13,6 +13,7 @@
 #include "./timer/lst_timer.h"
 #include <signal.h>
 #include <assert.h>
+#include "./log/log.h"
 
 #define MAX_FD 65535 //最多的文件描述符个数
 #define MAX_EVENT_NUMBER 10000  //最大监听的事件的个数
@@ -35,15 +36,20 @@ extern void setnoblock(int fd);
 
 //信号处理函数
 void sig_handler(int sig){
+	//为保证函数的可重入性，保留原来的errno
+	//可重入性表示中断后再次进入该函数，环境变量与之前不同，不会丢失数据
 	int save_errno = errno;
 	int msg = sig;
+	//将信号值从管道写端写入，传输字符类型，而非整型
 	send(pipefd[1], (char*)&msg, 1, 0);
 	errno = save_errno;
 }
 //添加监听信号,启动信号处理函数
 void addsig(int sig) {
+	//创建sigaction结构体变量
 	struct sigaction sa;
 	memset(&sa, '\0', sizeof(sa));
+	//信号处理函数中仅仅发送信号值，不做逻辑处理
 	sa.sa_handler = sig_handler;
 	sa.sa_flags |= SA_RESTART;
 	sigfillset(&sa.sa_mask);
@@ -64,9 +70,11 @@ void cb_func(client_data* user_data) {
 	close(user_data->sockfd);
 	//减少链接数
 	http_conn::m_user_count--;
-	printf("close fd%\n", user_data->sockfd);
+	printf("close fd %d\n", user_data->sockfd);
 }
 
+// //初始化数据库连接池
+// connection_pool *m_connPool = connection_pool::getInstance();
 
 int main(int argc, char* argv[]) {
 	if (argc <= 1) {
@@ -75,11 +83,26 @@ int main(int argc, char* argv[]) {
 	}
 	int port = atoi(argv[1]);
 
+	//创建日志对象，管理日志
+	Log::get_instance()->init("./runLog", 0, 2000, 800000, 800);
+
+
+	//初始化数据库连接池
+    connection_pool *m_connPool = connection_pool::getInstance();
+    m_connPool->init("localhost", "root", "1", "test", 3306, 10, 1);
+
 	//创建线程池    任务为http_conn类,处理用户连接
-	threadpool<http_conn>* pool = new threadpool<http_conn>;
+	threadpool<http_conn>* pool = new threadpool<http_conn>(m_connPool);
 
 	//创建一个数组用于保存用户的信息，处理业务
 	http_conn* users = new http_conn[MAX_FD];
+
+	// //初始化数据库连接池
+    // connection_pool *m_connPool = connection_pool::getInstance();
+    //m_connPool->init("localhost", "root", "1", "test", 3306, 10, 1);
+
+    //初始化数据库读取表
+    users->initmysql_result(m_connPool);
 
 	//创建监听socket
 	int listenfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -164,11 +187,14 @@ int main(int argc, char* argv[]) {
 				users_timer[connfd].timer = timer;
 				//将定时器添加到定时器容器（升序链表中）
 				timer_lst.add_timer(timer);
+
+				//users[connfd].initmysql_result(m_connPool);
 			}
 			else if (events[i].events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)) {
 				//对方异常或者错误断开
-				users[sockfd].close_conn();
+				//users[sockfd].close_conn();
 				util_timer *timer=users_timer[sockfd].timer;
+				timer->cb_func(&users_timer[sockfd]);  //用定时器来关闭相应的文件描述符
 				if(timer){
 					timer_lst.del_timer(timer);
 				}
@@ -212,17 +238,21 @@ int main(int argc, char* argv[]) {
 				//创建定时器临时变量，将该连接对应的定时器取出来
 				util_timer *timer=users_timer[sockfd].timer;
 				if(users[sockfd].read()){
+					//若检测到读事件，将事件放入请求队列
                     pool->append(users+sockfd);
+					
 					//若有数据传输，则将定时器往后延迟3个单位
 					//对其在链表上的位置进行调整
 					if(timer){
 						time_t cur = time(NULL);
 						timer->expire = cur + 3 * TIMESLOT;
+						LOG_INFO("%s","adjust timer once");
 						printf("adjust timer once\n");
 						timer_lst.adjust_timer(timer);
 					}
                 }else{
-                    users[sockfd].close_conn();
+                    //users[sockfd].close_conn();
+					timer->cb_func(&users_timer[sockfd]);
 					if(timer){
 						timer_lst.del_timer(timer);
 					}
@@ -243,7 +273,8 @@ int main(int argc, char* argv[]) {
 				}
 				else{
 					//服务器端关闭连接，移除对应的定时器
-                   users[sockfd].close_conn(); 
+                   //users[sockfd].close_conn(); 
+				   timer->cb_func(&users_timer[sockfd]);
 				   if(timer){
 						timer_lst.del_timer(timer);
 				   }
@@ -260,6 +291,9 @@ int main(int argc, char* argv[]) {
 	close(listenfd);
 	close(epollfd);
 	delete[] users;
+	close(pipefd[1]);
+	close(pipefd[0]);
+	delete[] users_timer;
     delete pool;
 	return 0;
 }

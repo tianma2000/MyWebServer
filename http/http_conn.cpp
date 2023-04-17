@@ -1,8 +1,14 @@
 #include "http_conn.h"
+#include "../log/log.h"
+#include "../lock/locker.h"
+#include <stdio.h>
+using namespace std;
 
 int http_conn::m_epollfd = -1;
 int http_conn::m_user_count = 0;
 
+map<string,string> users;
+locker m_lock;
 
 //定义HTTP响应的一些状态信息
 const char* ok_200_title = "OK";
@@ -15,9 +21,6 @@ const char* error_404_form = "The requested file was not found on this server.\n
 const char* error_500_title = "Internal Error";
 const char* error_500_form = "There was an unusual problem serving the request file.\n";
 
-
-
-
 //网站根目录
 const char* doc_root = "/home/zy/MyWebServer/root";
 
@@ -28,7 +31,7 @@ void setnoblock(int fd) {
 	fcntl(fd, F_SETFL, new_flag);
 }
 
-//添加文件描述符到epoll
+//将内核事件表注册读事件，ET模式，选择开启EPOLLONESHOT
 void addfd(int epollfd, int fd, bool oneshot) {
 	epoll_event event;
 	event.data.fd = fd;
@@ -76,6 +79,7 @@ void http_conn::init(int fd, sockaddr_in &address) {
 	init();
 }
 void http_conn::init() {
+	mysql=NULL;
 	m_read_index = 0;
 	m_check_state = CHECK_STATE_REQUESTLINE;
 	m_start_line = 0;
@@ -136,6 +140,7 @@ bool http_conn::read() {
 
 //非阻塞写,writev，写操作不会对m_iv中的两个数据进行任何操作?  bool是否还要继续写
 bool http_conn::write() {
+#if 0
 	int temp = 0;
 	int addnew = 0;   //m_file_address的偏移量
 	if (bytes_to_send == 0) {
@@ -163,9 +168,10 @@ bool http_conn::write() {
 				}
 				//还是继续发送第一个iovec数据
 				else {
-					m_iv[0].iov_len = m_iv[0].iov_len - bytes_have_send;
 					m_iv[0].iov_base =m_write_buff + bytes_have_send;
+					m_iv[0].iov_len = m_iv[0].iov_len - bytes_have_send;
 				}
+				//重新注册写事件
 				modfd(m_epollfd, m_sockfd, EPOLLOUT);
 				return true;
 			}		
@@ -192,7 +198,62 @@ bool http_conn::write() {
 		}
 
 	}
+#else 
+int temp = 0;
 
+    if (bytes_to_send == 0)
+    {
+        modfd(m_epollfd, m_sockfd, EPOLLIN);
+        init();
+        return true;
+    }
+
+    while (1)
+    {
+        temp = writev(m_sockfd, m_iv, m_iv_count);
+
+        if (temp < 0)
+        {
+            if (errno == EAGAIN)
+            {
+                modfd(m_epollfd, m_sockfd, EPOLLOUT);
+                return true;
+            }
+            unmap();
+            return false;
+        }
+
+        bytes_have_send += temp;
+        bytes_to_send -= temp;
+        if (bytes_have_send >= m_iv[0].iov_len)
+        {
+            m_iv[0].iov_len = 0;
+            m_iv[1].iov_base = m_file_address + (bytes_have_send - m_write_index);
+            m_iv[1].iov_len = bytes_to_send;
+        }
+        else
+        {
+            m_iv[0].iov_base = m_write_buff + bytes_have_send;
+            m_iv[0].iov_len = m_iv[0].iov_len - bytes_have_send;
+        }
+
+        if (bytes_to_send <= 0)
+        {
+            unmap();
+            modfd(m_epollfd, m_sockfd, EPOLLIN);
+
+            if (m_linger)
+            {
+                init();
+                return true;
+            }
+            else
+            {
+                return false;
+            }
+        }
+    }
+#endif
 }
 
 //解析HTTP请求，回复响应数据
@@ -226,6 +287,8 @@ http_conn::HTTP_CODE http_conn::process_read() {
 		text = get_line();
 		m_start_line = m_check_index;
 		//printf("获得一行待解析数据：%s\n",text);
+		LOG_INFO("%s",text);
+		Log::get_instance()->flush();
 		switch (m_check_state)
 		{
 		case CHECK_STATE_REQUESTLINE: 
@@ -288,7 +351,7 @@ bool http_conn::process_write(http_conn::HTTP_CODE ret) {
 		break;
 	}
 	//找不到资源404
-	case NO_RESOURCE:
+	case BAD_REQUEST:
 	{
 		//状态行
 		add_status_line(404, error_404_title);
@@ -307,18 +370,6 @@ bool http_conn::process_write(http_conn::HTTP_CODE ret) {
 		//行首部
 		add_headers(strlen(error_403_form));
 		if (!add_content(error_403_form)) {
-			return false;
-		}
-		break;
-	}
-	//语法有问题400
-	case BAD_REQUEST:
-	{
-		//状态行
-		add_status_line(400, error_400_title);
-		//行首部
-		add_headers(strlen(error_400_form));
-		if (!add_content(error_400_form)) {
 			return false;
 		}
 		break;
@@ -497,17 +548,82 @@ http_conn::HTTP_CODE http_conn::do_request() {
 	//初始化的m_real_file赋值为网站根目录
 	strcpy(m_real_file, doc_root);
 	int len = strlen(doc_root);
-
+	printf("m_url=%s\n",m_url);
 	//找到m_url中/的位置   需要找吗？ 按理来说m_url[0]一定是'/';
-	const char* p = strchr(m_url, '/');
+	const char* p = strrchr(m_url, '/');
 	
 	//实现登录和注册效验
-	if (cgi == 1 && (*(p + 1) == '2' || *(p + 2) == '3')) {
-		//根据标注判断是登录检测还是注册检测
+	if (cgi == 1 && (*(p + 1) == '2' || *(p + 1) == '3')) {
+		//根据标志判断是登录检测还是注册检测
+		char flag=m_url[1];
+		char *m_url_real=(char *)malloc(sizeof(char)*200);
+		strcpy(m_url_real,"/");
+		strcat(m_url_real,m_url+2);
+		strncpy(m_real_file+len,m_url_real,REAL_FILE_SIZE-len-1);
+		free(m_url_real);
+		//将用户名和密码提取出来
+		//user=123&password=123
+		char name[100],password[100];
+		int i;
+		//以&为分隔符，前面的为用户名
+		for(i=5;m_string[i]!='&';i++){
+			name[i - 5] = m_string[i];
+		}
+		name[i-5]='\0';
+		//以&为分隔符，后面是密码
+		int j = 0;
+        for (i = i + 10; m_string[i] != '\0'; ++i, ++j)
+            password[j] = m_string[i];
+        password[j] = '\0';
+
+		printf("--------------------解析出name=%s,password==%s==-------------------------\n",name,password);
 
 		//同步线程登录检测
 
 		//CGI多进程登录检测
+
+		 if (*(p + 1) == '3')
+        {
+            //如果是注册，先检测数据库中是否有重名的
+            //没有重名的，进行增加数据
+            char *sql_insert = (char *)malloc(sizeof(char) * 200);
+            strcpy(sql_insert, "INSERT INTO webdb(name,password) VALUES(");
+            strcat(sql_insert, "'");
+            strcat(sql_insert, name);
+            strcat(sql_insert, "', '");
+            strcat(sql_insert, password);
+            strcat(sql_insert, "')");
+			printf("sql_insert==%s\n",sql_insert);
+
+            if (users.find(name) == users.end())
+            {
+				// MYSQL * mysql=NULL;
+				// mysql=mysql_init(NULL);
+				// mysql=mysql_real_connect(mysql,"localhost","root","1","webdb",3306,NULL,0);
+                m_lock.lock();
+
+                int res = mysql_query(mysql, sql_insert);
+				printf("res==%d\n",res);
+                users.insert(pair<string, string>(name, password));
+                m_lock.unlock();
+
+                if (!res)
+                    strcpy(m_url, "/log.html");
+                else
+                    strcpy(m_url, "/registerError.html");
+            }
+            else
+                strcpy(m_url, "/registerError.html");
+        }
+		//如果是登录，直接判断
+        //若浏览器端输入的用户名和密码在表中可以查找到，返回1，否则返回0
+        else if (*(p + 1) == '2')
+        {
+            if (users.find(name) != users.end() && users[name] == password)
+                strcpy(m_url, "/welcome.html");
+            else
+                strcpy(m_url, "/logError.html");
+        }
 	}
 	
 	//如果请求资源为/0，表示跳转到注册界面
@@ -517,10 +633,11 @@ http_conn::HTTP_CODE http_conn::do_request() {
 
 		//将网站目录和/register.html进行拼接，更新到m_real_file中
 		strncpy(m_real_file + len, m_url_real, strlen(m_url_real));
+		printf("m_real_file=%s\n",m_real_file);
 		free(m_url_real);
 	}
 	//如果请求资源为/1，表示跳转到登录界面
-	if (*(p + 1) == '1') {
+	else if (*(p + 1) == '1') {
 		char* m_url_real = (char*)malloc(sizeof(char) * 200);
 		strcpy(m_url_real, "/log.html");
 
@@ -528,6 +645,33 @@ http_conn::HTTP_CODE http_conn::do_request() {
 		strncpy(m_real_file + len, m_url_real, strlen(m_url_real));
 		free(m_url_real);
 	}
+	//图片界面
+	else if (*(p + 1) == '5')
+    {
+        char *m_url_real = (char *)malloc(sizeof(char) * 200);
+        strcpy(m_url_real, "/picture.html");
+        strncpy(m_real_file + len, m_url_real, strlen(m_url_real));
+
+        free(m_url_real);
+    }
+	//视频界面
+    else if (*(p + 1) == '6')
+    {
+        char *m_url_real = (char *)malloc(sizeof(char) * 200);
+        strcpy(m_url_real, "/video.html");
+        strncpy(m_real_file + len, m_url_real, strlen(m_url_real));
+
+        free(m_url_real);
+    }
+	//关注页面
+    else if (*(p + 1) == '7')
+    {
+        char *m_url_real = (char *)malloc(sizeof(char) * 200);
+        strcpy(m_url_real, "/fans.html");
+        strncpy(m_real_file + len, m_url_real, strlen(m_url_real));
+
+        free(m_url_real);
+    }
 	else {
 		//如果以上均不符合，即不是登录和注册，直接将url与网站目录拼接
 		//这种情况就是welcome(judge.html)界面，请求服务器上的一个图片
@@ -574,6 +718,8 @@ bool http_conn::add_response(const char* format, ...) {
 	m_write_index += len;
 	//清空可变参数列表
 	va_end(arg_list);
+	LOG_INFO("request:%s", m_write_buff);
+	Log::get_instance()->flush();
 	return true;
 }
 //添加状态行
@@ -604,5 +750,33 @@ void http_conn::unmap() {
 	if (!m_file_address) {
 		munmap(m_file_address, m_file_stat.st_size);
 		m_file_address = 0;
+	}
+}
+
+void http_conn::initmysql_result(connection_pool *connPool){
+	//先从连接池中取一个连接
+	MYSQL *mysql=NULL;
+	connectionRAII mysqlcon(&mysql,connPool);
+
+	//在user表中检索username,passwd数据，浏览器端输入
+	if(mysql_query(mysql,"select name,password from webdb")){
+		LOG_ERROR("SELECT error:%s\n",mysql_error(mysql));
+	}
+
+	//从表中检索完整的结果集
+	MYSQL_RES *result=mysql_store_result(mysql);
+
+	//返回结果集中的列数
+	int num_fields=mysql_num_fields(result);
+
+	//返回所有字段结构的数组
+	MYSQL_FIELD *fields=mysql_fetch_fields(result);
+
+	//从结果集中获取下一行，将对应的用户名和密码，存入map中
+	while(MYSQL_ROW row=mysql_fetch_row(result)){
+		string temp1(row[0]);
+		string temp2(row[1]);
+		users[temp1]=temp2;
+		printf("temp1=%s,temp2=%s\n",temp1,temp2);
 	}
 }

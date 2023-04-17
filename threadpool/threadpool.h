@@ -5,12 +5,13 @@
 #include <list>
 #include <cstdio>
 #include <exception>
+#include "../cgimysql/sql_connection_pool.h"
 
 //将任务设置为模板
 template <typename T>
 class threadpool {
 public:
-	threadpool(int threadnumber = 8, int max_request = 10000);
+	threadpool(connection_pool* connPool,int threadnumber = 8, int max_request = 10000);
 	~threadpool();
 	bool append(T* request);
 private:
@@ -23,9 +24,10 @@ private:
 	std::list<T*> m_workqueue;//请求队列
 	int m_threadnumber;//线程的数量
 	bool m_shotdown;  //是否关闭线程池
+	connection_pool * m_connPool;   //数据库
 };
 template <typename T>
-threadpool<T>::threadpool(int threadnumber, int max_requst) :m_threadnumber(threadnumber), m_max_request(max_requst),
+threadpool<T>::threadpool(connection_pool * connPool,int threadnumber, int max_requst) :m_connPool(connPool),m_threadnumber(threadnumber), m_max_request(max_requst),
 m_shotdown(false), m_threads(NULL) {
     if((m_threadnumber<=0)||(max_requst<=0)){
         throw std::exception();
@@ -87,6 +89,7 @@ void* threadpool<T>::work(void* arg) {
         if(!request){
             continue;
         }
+		connectionRAII mysqlcon(&request->mysql, pool->m_connPool);//更改
 		request->process();
 	}
     return pool;

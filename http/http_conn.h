@@ -14,6 +14,9 @@
 #include <stdarg.h>
 #include <sys/uio.h>
 
+#include "../cgimysql/sql_connection_pool.h"
+#include <map>
+
 class http_conn
 {
 public:
@@ -32,6 +35,7 @@ public:
 	~http_conn();
 	static int m_epollfd;
 	static int m_user_count;
+	MYSQL * mysql;
 	static const int READ_BUFF_SIZE = 2048;//读缓冲区的大小
 	static const int WRITE_BUFF_SIZE = 1024;//写缓冲区的大小
 	static const int REAL_FILE_SIZE = 200; //用来存文件名
@@ -40,6 +44,8 @@ public:
 	bool read();      //读入HTTP数据
     bool write();
 	void process();    //执行任务，处理业务逻辑。（数据通过请求队列（就是m_read_buf）传递），接下来就是解析数据，返回响应数据
+
+	void initmysql_result(connection_pool *connPool);  //将数据库中的用户名载入到服务器的map中来，map中key为用户名，value为密码
 
 private:
 	int m_sockfd;
@@ -97,6 +103,8 @@ private:
 	int bytes_have_send;  //已经发送了的数据
 
 	void unmap(); //取消映射
+private:
+	map<string,string> m_users;
 };
 
 #endif // !HTTP_CONN_H

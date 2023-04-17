@@ -20,6 +20,9 @@ public:
 	void unlock() {
 		pthread_mutex_unlock(&m_mutex);
 	}
+	pthread_mutex_t * get(){
+		return &m_mutex;
+	}
 private:
 	pthread_mutex_t m_mutex;
 };
@@ -33,11 +36,27 @@ public:
 	~cond() {
 		pthread_cond_destroy(&m_cond);
 	}
-	void wait(pthread_mutex_t * locker) {
-		pthread_cond_wait(&m_cond, locker);
-	}
+	bool wait(pthread_mutex_t *m_mutex)
+    {
+        int ret = 0;
+        //pthread_mutex_lock(&m_mutex);
+        ret = pthread_cond_wait(&m_cond, m_mutex);
+        //pthread_mutex_unlock(&m_mutex);
+        return ret == 0;
+    }
+	bool timewait(pthread_mutex_t *m_mutex, struct timespec t)
+    {
+        int ret = 0;
+        //pthread_mutex_lock(&m_mutex);
+        ret = pthread_cond_timedwait(&m_cond, m_mutex, &t);
+        //pthread_mutex_unlock(&m_mutex);
+        return ret == 0;
+    }
 	void signal() {
 		pthread_cond_signal(&m_cond);
+	}
+	void broadcast(){
+		pthread_cond_broadcast(&m_cond);
 	}
 private:
 	pthread_cond_t m_cond;

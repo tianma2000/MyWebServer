@@ -118,24 +118,24 @@ void sort_timer_lst::tick(){
 /*一个重载的辅助函数，它被公有的add_timer函数和addjust_tiemr函数调用。该函数表示将目标定时器timer添加到节点lst_head之后的部分链表中*/
 void sort_timer_lst::add_timer(util_timer*timer,util_timer*lst_head){
 	util_timer* prev = lst_head;
-		util_timer* tmp = prev->next;
-		/*遍历lst_head节点之后的部分链表，直到找到一个超时时间大于目标定时器的超时时间节点，并将目标节点定时器插入该节点之前*/
-		while (tmp) {
-			if (timer->expire < tmp->expire) {
-				prev->next = timer;
-				timer->next = tmp;
-				tmp->prev = timer;
-				timer->prev = prev;
-				break;
-			}
-			prev = tmp;
-			tmp = tmp->next;
-		}
-		/*如果遍历完lst_head节点之后的部分链表，仍未找到超时时间大于目标定时器的超时时间节点，则将目标定时器插入到链表尾部，并把它设置为链表新尾节点*/
-		if (!tmp) {
+	util_timer* tmp = prev->next;
+	/*遍历lst_head节点之后的部分链表，直到找到一个超时时间大于目标定时器的超时时间节点，并将目标节点定时器插入该节点之前*/
+	while (tmp) {
+		if (timer->expire < tmp->expire) {
 			prev->next = timer;
+			timer->next = tmp;
+			tmp->prev = timer;
 			timer->prev = prev;
-			timer->next = NULL;
-			tail = timer;
+			break;
 		}
+		prev = tmp;
+		tmp = tmp->next;
+	}
+	/*如果遍历完lst_head节点之后的部分链表，仍未找到超时时间大于目标定时器的超时时间节点，则将目标定时器插入到链表尾部，并把它设置为链表新尾节点*/
+	if (!tmp) {
+		prev->next = timer;
+		timer->prev = prev;
+		timer->next = NULL;
+		tail = timer;
+	}
 }
